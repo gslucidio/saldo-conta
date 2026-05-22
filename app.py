@@ -1,133 +1,141 @@
 """
 Dashboard FIC FIDC — UI Streamlit.
-Faz upload de extrato bancário (CSV) e carteira do fundo de liquidez (XLSX),
-gera o resumo pronto para copiar no WhatsApp.
+
+Fluxo:
+  1. Upload do extrato bancário (CSV) e de uma ou mais carteiras de fundo de
+     liquidez (XLSX) — um fundo pode aplicar em vários fundos de liquidez.
+  2. Identifica automaticamente cada contraparte das movimentações PIX/TED e
+     soma entrada (créditos), saída (débitos) e líquido de cada uma.
+  3. Mostra, à parte, o saldo (fundo de liquidez + conta).
+  4. Gera o texto pronto para colar no WhatsApp.
 
 Rodar localmente:  streamlit run app.py
 """
-import pandas as pd
 import streamlit as st
 
-from config import MESES_PT
 from core import (
-    computar_aportes,
-    computar_gastos,
+    agregar_pessoas,
     computar_saldo_conta,
     fmt_brl,
     gerar_resumo,
     limpar_nome_fundo,
     parse_carteira,
     parse_extrato,
+    somar_saldo_liquidez,
 )
 
 st.set_page_config(page_title="Resumo FIC FIDC", page_icon="📊", layout="centered")
 
 st.title("📊 Resumo FIC FIDC para WhatsApp")
 st.caption(
-    "Faça upload do extrato bancário (CSV) e da posição do fundo no fundo "
-    "de liquidez (XLSX). O resumo é gerado pronto para copiar e colar."
+    "Upload do extrato bancário (CSV) e da(s) carteira(s) do fundo nos fundos "
+    "de liquidez (XLSX). Cada contraparte é somada automaticamente e o resumo "
+    "sai pronto para copiar."
 )
 
-col1, col2 = st.columns(2)
-with col1:
-    extrato_file = st.file_uploader(
-        "Extrato bancário (CSV)",
-        type=["csv"],
-        help="Arquivo `.CSV` exportado da conta do fundo, separador `;`.",
-    )
-with col2:
-    carteira_file = st.file_uploader(
-        "Carteira fundo de liquidez (XLSX)",
-        type=["xlsx"],
-        help="Relatório 'Saldo de Aplicações de Cotistas' com o fundo como cotista.",
-    )
+extrato_file = st.file_uploader(
+    "Extrato bancário (CSV)",
+    type=["csv"],
+    help="Arquivo `.CSV` exportado da conta do fundo, separador `;`.",
+)
+carteira_files = st.file_uploader(
+    "Carteira(s) do fundo de liquidez (XLSX) — pode enviar mais de uma",
+    type=["xlsx"],
+    accept_multiple_files=True,
+    help="Relatório 'Saldo de Aplicações de Cotistas'. Se o fundo aplica em "
+         "vários fundos de liquidez, envie um XLSX de cada — os saldos são somados.",
+)
 
-if not (extrato_file and carteira_file):
-    st.info("⬆️ Aguardando upload dos dois arquivos.")
+if not extrato_file:
+    st.info("⬆️ Envie ao menos o extrato bancário (CSV) para começar.")
     st.stop()
 
 # --- Parsing ---
 try:
     df = parse_extrato(extrato_file)
-    carteira = parse_carteira(carteira_file)
 except Exception as e:
-    st.error(f"Erro ao processar os arquivos: {e}")
-    st.exception(e)
+    st.error(f"Erro ao ler o extrato CSV: {e}")
     st.stop()
 
-# --- Ajustes (defaults vindos do XLSX) ---
-nome_default = limpar_nome_fundo(carteira.get("cotista_nome"))
+carteiras = []
+for f in carteira_files or []:
+    try:
+        carteiras.append(parse_carteira(f))
+    except Exception as e:
+        st.warning(f"Não consegui ler a carteira '{f.name}': {e}")
+
+# --- Saldos ---
+saldo_conta = computar_saldo_conta(df)
+saldo_liquidez = somar_saldo_liquidez(carteiras)
+
+# --- Nome do fundo (default vindo do 1º XLSX que tiver cotista_nome) ---
+nome_default = "FIC FIDC"
+for c in carteiras:
+    if c.get("cotista_nome"):
+        nome_default = limpar_nome_fundo(c["cotista_nome"])
+        break
+
+# --- Agregação por pessoa ---
+pessoas = agregar_pessoas(df)
 
 with st.expander("⚙️ Ajustes", expanded=False):
     nome_fundo = st.text_input("Cabeçalho do resumo", value=nome_default)
 
-    saldo_lido = carteira.get("saldo_liquido")
-    if saldo_lido is None:
-        st.warning("Não consegui ler o Saldo Líquido do XLSX — informe abaixo.")
+    if not carteiras:
+        st.warning("Nenhuma carteira XLSX enviada — informe o saldo manualmente.")
         saldo_liquidez = st.number_input(
-            "Saldo no fundo de liquidez (R$)", value=0.0, step=0.01, format="%.2f"
+            "Saldo total nos fundos de liquidez (R$)",
+            value=0.0, step=0.01, format="%.2f",
         )
     else:
-        override = st.checkbox("Sobrescrever saldo do fundo de liquidez", value=False)
-        if override:
-            saldo_liquidez = st.number_input(
-                "Saldo no fundo de liquidez (R$)",
-                value=float(saldo_lido), step=0.01, format="%.2f",
+        sem_saldo = [c for c in carteiras if c.get("saldo_liquido") is None]
+        if sem_saldo:
+            st.warning(
+                f"{len(sem_saldo)} carteira(s) sem saldo legível — confira abaixo."
             )
-        else:
-            saldo_liquidez = float(saldo_lido)
+        if st.checkbox("Sobrescrever saldo dos fundos de liquidez", value=False):
+            saldo_liquidez = st.number_input(
+                "Saldo total nos fundos de liquidez (R$)",
+                value=float(saldo_liquidez), step=0.01, format="%.2f",
+            )
 
-    # Seletor de mês de referência
-    meses = (
-        df["dt_mov"].dt.to_period("M")
-        .drop_duplicates()
-        .sort_values(ascending=False)
-    )
-    opcoes_mes = [(p.year, p.month) for p in meses]
-    rotulos = [f"{MESES_PT[m]}/{a}" for a, m in opcoes_mes]
-    idx = st.selectbox(
-        "Mês para 'Gastos do fundo em <mês>'",
-        options=range(len(opcoes_mes)),
-        format_func=lambda i: rotulos[i],
-        index=0,
-    )
-    mes_ref = opcoes_mes[idx]
-
-# --- Cálculos ---
-saldo_conta = computar_saldo_conta(df)
-aportes = computar_aportes(df)
-gastos, mes_ref = computar_gastos(df, mes_ref)
+if pessoas.empty:
+    st.warning("Nenhuma movimentação PIX/TED encontrada no extrato.")
+    st.stop()
 
 # --- Saída para WhatsApp ---
-resumo = gerar_resumo(nome_fundo, saldo_conta, saldo_liquidez, aportes, gastos, mes_ref)
+resumo = gerar_resumo(nome_fundo, saldo_conta + saldo_liquidez, pessoas)
 
 st.subheader("📋 Copie e cole no WhatsApp")
-# st.code já vem com botão de copiar embutido (ícone no canto superior direito)
-st.code(resumo, language=None)
+st.code(resumo, language=None)  # st.code já tem botão de copiar embutido
 
 # --- Detalhes / sanity check ---
 with st.expander("🔍 Detalhes (sanity check)"):
     c1, c2, c3 = st.columns(3)
     c1.metric("Saldo em conta", fmt_brl(saldo_conta))
-    c2.metric("Saldo fundo liquidez", fmt_brl(saldo_liquidez))
+    c2.metric("Saldo fundos liquidez", fmt_brl(saldo_liquidez))
     c3.metric("Total consolidado", fmt_brl(saldo_conta + saldo_liquidez))
 
     st.write(
         f"**Período do extrato:** {df['dt_mov'].min():%d/%m/%Y} → "
         f"{df['dt_mov'].max():%d/%m/%Y} · {len(df)} lançamentos"
     )
-    st.write(f"**Fundo de liquidez (do XLSX):** {carteira.get('fundo_liquidez') or '—'}")
-    st.write(f"**Cotista (do XLSX):** {carteira.get('cotista_nome') or '—'}")
+    if carteiras:
+        st.markdown("**Carteiras de liquidez carregadas:**")
+        for c in carteiras:
+            st.write(
+                f"- {c.get('fundo_liquidez') or '—'} · cotista "
+                f"{c.get('cotista_nome') or '—'} · "
+                f"{fmt_brl(c.get('saldo_liquido') or 0.0)}"
+            )
 
-    st.markdown("**Aportes por cotista**")
-    aportes_df = pd.DataFrame(aportes).T[["entrada", "saida", "liquido"]]
-    aportes_df.columns = ["Entrada", "Saída", "Líquido"]
-    st.dataframe(aportes_df.style.format(fmt_brl), use_container_width=True)
-
-    st.markdown("**Gastos por categoria**")
-    gastos_df = pd.DataFrame(gastos).T[["debitos", "creditos", "liquido", "mes"]]
-    gastos_df.columns = [
-        "Débitos", "Créditos/Reemb.", "Líquido",
-        f"No mês ({MESES_PT[mes_ref[1]]}/{mes_ref[0]})",
-    ]
-    st.dataframe(gastos_df.style.format(fmt_brl), use_container_width=True)
+    st.markdown("**Movimentações por contraparte (PIX/TED):**")
+    tabela = pessoas.copy()
+    tabela.columns = ["Nome", "Entrada", "Saída", "Líquido"]
+    st.dataframe(
+        tabela.style.format({
+            "Entrada": fmt_brl, "Saída": fmt_brl, "Líquido": fmt_brl,
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )

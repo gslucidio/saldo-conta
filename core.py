@@ -1,6 +1,10 @@
 """
-Lógica pura (parsing + cálculos + geração de texto) do dashboard FIC FIDC.
-Sem dependência de Streamlit — facilita testes e reuso.
+Lógica pura do dashboard FIC FIDC: parsing + agregação de movimentações por
+pessoa + geração do texto. Sem dependência de Streamlit.
+
+Não há classificação de cotista/prestador. Toda contraparte que aparece em
+movimentações PIX/TED é agregada e listada com entrada, saída e líquido.
+O saldo (fundo de liquidez + conta) é apresentado à parte.
 """
 from __future__ import annotations
 
@@ -11,20 +15,55 @@ from typing import IO
 import pandas as pd
 from openpyxl import load_workbook
 
-from config import COTISTAS, DESPESAS, ABREV, MESES_PT
+from config import SUFIXOS_EMPRESA
 
 
 # =============================================================================
-# Helpers de formatação
+# Formatação
 # =============================================================================
 
 def fmt_brl(v: float) -> str:
     """Formata número como 'R$ 1.234,56' (padrão brasileiro)."""
-    # Normaliza signed zero (-0.0 → 0.0) para evitar 'R$ -0,00'
-    if v == 0:
+    if v == 0:  # normaliza -0.0
         v = 0.0
     s = f"{v:,.2f}"
     return "R$ " + s.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+# =============================================================================
+# Normalização de nomes de contraparte
+# =============================================================================
+
+def normaliza_parte(comp: str) -> str:
+    """Remove prefixos 'Dest:'/'Rem:', sufixo '-ESTORNO', colapsa espaços, MAIÚSCULAS."""
+    s = str(comp or "").strip()
+    s = re.sub(r"^(Dest:|Rem:)\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*-\s*ESTORNO\s*$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.upper()
+
+
+def chave_parte(nome_norm: str) -> str:
+    """
+    Chave de agrupamento: remove sufixos societários (LTDA, S.A., ...) para juntar
+    'ELANTRA PARTICIPACOES' e 'ELANTRA PARTICIPACOES LTDA' como a mesma pessoa.
+    """
+    s = nome_norm
+    mudou = True
+    while mudou:
+        mudou = False
+        for suf in SUFIXOS_EMPRESA:
+            padrao = r"\s*\b" + re.escape(suf) + r"\b\.?\s*$"
+            novo = re.sub(padrao, "", s, flags=re.IGNORECASE).strip()
+            if novo != s:
+                s = novo
+                mudou = True
+    return re.sub(r"[.\s]+$", "", s).strip()
+
+
+def nome_exibicao(nome_norm: str) -> str:
+    """'KOVR CAPITALIZACAO S A' → 'Kovr Capitalizacao' (limpa sufixo + title case)."""
+    return chave_parte(nome_norm).title()
 
 
 # =============================================================================
@@ -32,7 +71,6 @@ def fmt_brl(v: float) -> str:
 # =============================================================================
 
 def _ler_csv_bytes(data: bytes) -> pd.DataFrame:
-    """Lê CSV semicolon-separated, tentando múltiplas codificações."""
     for enc in ("utf-8", "latin-1", "cp1252"):
         try:
             return pd.read_csv(BytesIO(data), sep=";", encoding=enc)
@@ -42,12 +80,7 @@ def _ler_csv_bytes(data: bytes) -> pd.DataFrame:
 
 
 def parse_extrato(file: IO[bytes] | str) -> pd.DataFrame:
-    """
-    Lê o extrato bancário (CSV) e devolve um DataFrame normalizado,
-    com coluna `valor_assinado` (positivo p/ crédito, negativo p/ débito).
-
-    Aceita arquivo (file-like) ou caminho.
-    """
+    """Lê o extrato (CSV) e cria `valor_assinado` (+ crédito, − débito)."""
     if isinstance(file, str):
         with open(file, "rb") as f:
             data = f.read()
@@ -67,18 +100,7 @@ def parse_extrato(file: IO[bytes] | str) -> pd.DataFrame:
 
 
 def parse_carteira(file: IO[bytes] | str) -> dict:
-    """
-    Lê o XLSX 'Saldo de Aplicações de Cotistas'.
-
-    Estratégia:
-      1. Localiza a coluna com cabeçalho 'Saldo Líquido'.
-      2. Captura o nome do fundo de liquidez na linha 'Carteira:'.
-      3. Captura o nome do cotista (regex no padrão '<num> - NOME - Aberto - ...').
-      4. Lê o Saldo Líquido na linha 'Total:'.
-
-    Retorna {saldo_liquido, fundo_liquidez, cotista_nome}.
-    Qualquer campo pode vir None se o layout for diferente.
-    """
+    """Lê um XLSX 'Saldo de Aplicações'. Retorna {saldo_liquido, fundo_liquidez, cotista_nome}."""
     wb = load_workbook(file, read_only=True, data_only=True)
     ws = wb.active
     rows = list(ws.iter_rows(values_only=True))
@@ -129,180 +151,91 @@ def parse_carteira(file: IO[bytes] | str) -> dict:
 
 
 # =============================================================================
-# Classificadores
-# =============================================================================
-
-def _classifica_cotista(complemento: str) -> str | None:
-    comp = (complemento or "").upper()
-    for nome, padroes in COTISTAS.items():
-        for p in padroes:
-            if p.upper() in comp:
-                return nome
-    return None
-
-
-def _classifica_despesa(row) -> str | None:
-    hist = (row["ds_historico"] or "").upper()
-    comp = (row["ds_complemento"] or "").upper()
-    for nome, padroes, onde in DESPESAS:
-        alvo = comp if onde == "complemento" else hist
-        for p in padroes:
-            if p.upper() in alvo:
-                return nome
-    return None
-
-
-# =============================================================================
-# Cálculos
+# Agregação e saldo
 # =============================================================================
 
 def computar_saldo_conta(df: pd.DataFrame) -> float:
-    """Saldo final em conta-corrente = soma de todos os valores assinados."""
+    """Saldo final em conta-corrente = soma dos valores assinados."""
     return float(df["valor_assinado"].sum())
 
 
-def computar_aportes(df: pd.DataFrame) -> dict:
-    """
-    Movimentos de cotistas via PIX/TED/TEC.
-    Transferências internas entre contas do banco são ignoradas.
-    Retorna {cotista: {entrada, saida, liquido}}.
-    """
-    sub = df.copy()
-    sub["cotista"] = sub["ds_complemento"].apply(_classifica_cotista)
-    sub = sub[sub["cotista"].notna()]
-    mask_movs = sub["ds_historico"].str.contains(
-        r"PIX|TED|TEC", case=False, regex=True
-    )
-    sub = sub[mask_movs]
+def somar_saldo_liquidez(carteiras: list[dict]) -> float:
+    """Soma o saldo_liquido de várias carteiras (ignora None)."""
+    return float(sum(c.get("saldo_liquido") or 0.0 for c in carteiras))
 
-    out = {}
-    for nome in COTISTAS:
-        s = sub[sub["cotista"] == nome]
-        entrada = float(s.loc[s["valor_assinado"] > 0, "valor_assinado"].sum())
-        saida = float(-s.loc[s["valor_assinado"] < 0, "valor_assinado"].sum())
-        out[nome] = {
+
+def agregar_pessoas(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Agrega cada contraparte das movimentações PIX/TED por nome (variações do
+    mesmo nome são unidas).
+
+    Entrada = créditos (dinheiro que entrou na conta do fundo);
+    Saída   = débitos (dinheiro que saiu, inclui devoluções/estornos).
+    A classificação usa o flag débito/crédito do extrato — assim uma linha
+    'PIX - RECEBIDO DEVOLVIDO' (que é um débito) entra corretamente na saída.
+
+    Retorna DataFrame [nome, entrada, saida, liquido] ordenado por líquido desc.
+    Linhas sem entrada e sem saída (ex.: tarifas) são descartadas.
+    """
+    movs = df[
+        df["ds_historico"].str.contains(r"PIX|TED|TEC", case=False, regex=True, na=False)
+        & ~df["ds_historico"].str.contains(r"TARIFA", case=False, regex=True, na=False)
+    ].copy()
+
+    if movs.empty:
+        return pd.DataFrame(columns=["nome", "entrada", "saida", "liquido"])
+
+    movs["parte_norm"] = movs["ds_complemento"].apply(normaliza_parte)
+    movs["chave"] = movs["parte_norm"].apply(chave_parte)
+    movs["credito"] = movs["fl_debito_credito"] == "C"
+
+    registros = []
+    for chave, grupo in movs.groupby("chave"):
+        if not chave:
+            continue
+        entrada = float(grupo.loc[grupo["credito"], "valor"].sum())
+        saida = float(grupo.loc[~grupo["credito"], "valor"].sum())
+        if entrada == 0 and saida == 0:
+            continue
+        nome_norm = max(grupo["parte_norm"], key=len)
+        registros.append({
+            "nome": nome_exibicao(nome_norm),
             "entrada": entrada,
             "saida": saida,
             "liquido": entrada - saida,
-        }
-    return out
+        })
 
-
-def computar_gastos(df: pd.DataFrame, mes_ref: tuple | None = None):
-    """
-    Despesas por categoria, total e do mês de referência.
-    Retorna (gastos, mes_ref) onde gastos = {categoria: {debitos, creditos, liquido, mes}}.
-    """
-    sub = df.copy()
-    sub["categoria"] = sub.apply(_classifica_despesa, axis=1)
-    sub = sub[sub["categoria"].notna()]
-
-    if mes_ref is None and len(df) > 0:
-        ult = df["dt_mov"].max()
-        mes_ref = (ult.year, ult.month)
-
-    gastos = {}
-    for categoria, _, _ in DESPESAS:
-        s = sub[sub["categoria"] == categoria]
-        debitos = float(-s.loc[s["valor_assinado"] < 0, "valor_assinado"].sum())
-        creditos = float(s.loc[s["valor_assinado"] > 0, "valor_assinado"].sum())
-        liquido = debitos - creditos
-
-        liquido_mes = 0.0
-        if mes_ref:
-            sm = s[
-                (s["dt_mov"].dt.year == mes_ref[0])
-                & (s["dt_mov"].dt.month == mes_ref[1])
-            ]
-            d_mes = float(-sm.loc[sm["valor_assinado"] < 0, "valor_assinado"].sum())
-            c_mes = float(sm.loc[sm["valor_assinado"] > 0, "valor_assinado"].sum())
-            liquido_mes = d_mes - c_mes
-
-        gastos[categoria] = {
-            "debitos": debitos,
-            "creditos": creditos,
-            "liquido": liquido,
-            "mes": liquido_mes,
-        }
-    return gastos, mes_ref
+    out = pd.DataFrame(registros)
+    if out.empty:
+        return out
+    return out.sort_values("liquido", ascending=False).reset_index(drop=True)
 
 
 # =============================================================================
 # Geração do texto para WhatsApp
 # =============================================================================
 
-def gerar_resumo(
-    nome_fundo: str,
-    saldo_conta: float,
-    saldo_liquidez: float,
-    aportes: dict,
-    gastos: dict,
-    mes_ref: tuple | None,
-) -> str:
-    """Monta o texto final pronto para colar no WhatsApp."""
-    out = [nome_fundo]
-    out.append(
-        f"- Saldo fundo de liquidez + saldo em conta: "
-        f"{fmt_brl(saldo_conta + saldo_liquidez)}"
-    )
+def gerar_resumo(nome_fundo: str, saldo_total: float, pessoas: pd.DataFrame) -> str:
+    """Monta o texto: cabeçalho, lista por pessoa e, à parte, o saldo."""
+    out = [nome_fundo, ""]
 
-    # Aportes — apenas cotistas com movimento, ordenados por líquido desc
-    out.append("- Aportes por cotista:")
-    cot_ord = sorted(
-        [(n, d) for n, d in aportes.items() if d["entrada"] or d["saida"]],
-        key=lambda x: x[1]["liquido"],
-        reverse=True,
-    )
-    for nome, d in cot_ord:
-        out.append(f"{nome}:")
-        out.append(f"Entrada: {fmt_brl(d['entrada'])}")
-        out.append(f"Saída: {fmt_brl(d['saida'])}")
-        out.append(f"Líquido: {fmt_brl(d['liquido'])}")
+    for _, r in pessoas.sort_values("liquido", ascending=False).iterrows():
+        out.append(f"{r['nome']}:")
+        out.append(f"Entrada: {fmt_brl(r['entrada'])}")
+        out.append(f"Saída: {fmt_brl(r['saida'])}")
+        out.append(f"Líquido: {fmt_brl(r['liquido'])}")
 
-    # Gastos do mês
-    if mes_ref:
-        total_mes = sum(g["mes"] for g in gastos.values())
-        abrev_mes, vistos = [], set()
-        for cat, g in gastos.items():
-            if g["mes"] <= 0:
-                continue
-            ab = ABREV.get(cat)
-            if ab and ab not in vistos:
-                abrev_mes.append(ab)
-                vistos.add(ab)
-        sufixo = f" ({', '.join(abrev_mes)})" if abrev_mes else ""
-        out.append(
-            f"- Gastos do fundo em {MESES_PT[mes_ref[1]]}: "
-            f"{fmt_brl(total_mes)}{sufixo}"
-        )
-
-    # Gastos desde o início
-    total_geral = sum(g["liquido"] for g in gastos.values())
-    out.append(f"- Gastos do fundo desde o início: {fmt_brl(total_geral)}")
-
-    # Sorted: líquido desc, mas Tarifas vão pro fim
-    cats_ord = sorted(
-        [(c, g) for c, g in gastos.items() if g["liquido"] > 0],
-        key=lambda x: (x[0].startswith("Tarifas"), -x[1]["liquido"]),
-    )
-    for cat, g in cats_ord:
-        if g["creditos"] > 0:
-            out.append(
-                f"{cat}: Débitos: {fmt_brl(g['debitos'])}; "
-                f"Reembolsos/Créditos: {fmt_brl(g['creditos'])}; "
-                f"Líquido: {fmt_brl(g['liquido'])}"
-            )
-        else:
-            out.append(f"{cat}: {fmt_brl(g['liquido'])}")
-
+    out.append("")
+    out.append(f"Saldo (fundo de liquidez + conta): {fmt_brl(saldo_total)}")
     return "\n".join(out)
 
 
 def limpar_nome_fundo(nome_bruto: str | None) -> str:
-    """Converte 'FIC FIDC ELANTRA RL' → 'FIC FIDC Elantra'."""
+    """'FIC FIDC ELANTRA RL' → 'FIC FIDC Elantra'."""
     if not nome_bruto:
         return "FIC FIDC"
     s = nome_bruto.title()
     s = re.sub(r"\bFic Fidc\b", "FIC FIDC", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bFidc\b", "FIDC", s, flags=re.IGNORECASE)
     s = re.sub(r"\bRl\b\s*$", "", s).strip()
     return s
