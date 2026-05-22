@@ -10,11 +10,11 @@ saída e líquido. À parte, mostra o saldo (fundo de liquidez + conta):
 ```
 FIC FIDC Kmr Capital
 
-Marcos Baptista Villela:
+Marcos:
 Entrada: R$ 510.000,00
 Saída: R$ 0,00
 Líquido: R$ 510.000,00
-Leonardo Vigolo:
+Leonardo:
 Entrada: R$ 506.023,00
 Saída: R$ 0,00
 Líquido: R$ 506.023,00
@@ -34,8 +34,7 @@ do extrato — sem classificar ninguém como cotista ou prestador. Para cada uma
 
 A classificação usa o flag de débito/crédito do próprio extrato, então uma linha
 como `PIX - RECEBIDO DEVOLVIDO` (que é um débito) entra corretamente na saída e
-um estorno no mesmo dia se anula. Variações do mesmo nome (ex.: `ELANTRA
-PARTICIPACOES` e `ELANTRA PARTICIPACOES LTDA`) são agrupadas como a mesma pessoa.
+um estorno no mesmo dia se anula. Variações do mesmo nome são agrupadas como a mesma pessoa.
 Linhas de tarifa bancária não viram contraparte (já estão refletidas no saldo).
 
 ## Estrutura
