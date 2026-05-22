@@ -15,7 +15,7 @@ from typing import IO
 import pandas as pd
 from openpyxl import load_workbook
 
-from config import SUFIXOS_EMPRESA
+from config import SUFIXOS_EMPRESA, PADROES_FUNDO_LIQUIDEZ
 
 
 # =============================================================================
@@ -164,7 +164,53 @@ def somar_saldo_liquidez(carteiras: list[dict]) -> float:
     return float(sum(c.get("saldo_liquido") or 0.0 for c in carteiras))
 
 
-def agregar_pessoas(df: pd.DataFrame) -> pd.DataFrame:
+def reconciliar_liquidez(df: pd.DataFrame) -> dict:
+    """
+    Reconciliação extrato × fundo de liquidez.
+
+    Nas linhas dos fundos de liquidez (ID RF / ID SOBERANO):
+      - Débito (D) = dinheiro ENTRANDO no fundo de liquidez (aplicação);
+      - Crédito (C) = dinheiro SAINDO do fundo de liquidez (resgate).
+    Líquido investido = soma(D) − soma(C).
+
+    O saldo atual no XLSX = líquido investido + rendimento acumulado.
+    Logo: rendimento = saldo_xlsx − líquido investido (deve ser ~positivo).
+
+    Retorna {por_fundo: {nome: {entrou, saiu, liquido}}, liquido_total}.
+    """
+    comp = df["ds_complemento"].fillna("").astype(str).str.upper()
+    por_fundo = {}
+    liquido_total = 0.0
+    for nome_curto, padroes in PADROES_FUNDO_LIQUIDEZ.items():
+        mask = pd.Series(False, index=df.index)
+        for p in padroes:
+            mask |= comp.str.contains(re.escape(p.upper()), regex=True)
+        g = df[mask]
+        if g.empty:
+            continue
+        entrou = float(g.loc[g["fl_debito_credito"] == "D", "valor"].sum())  # aplicação
+        saiu = float(g.loc[g["fl_debito_credito"] == "C", "valor"].sum())    # resgate
+        liq = entrou - saiu
+        por_fundo[nome_curto] = {"entrou": entrou, "saiu": saiu, "liquido": liq}
+        liquido_total += liq
+    return {"por_fundo": por_fundo, "liquido_total": liquido_total}
+
+
+def meses_disponiveis(df: pd.DataFrame) -> list[tuple[int, int]]:
+    """Lista (ano, mês) presentes no extrato, do mais recente para o mais antigo."""
+    per = df["dt_mov"].dt.to_period("M").drop_duplicates().sort_values(ascending=False)
+    return [(p.year, p.month) for p in per]
+
+
+def _filtra_periodo(df: pd.DataFrame, periodo: tuple[int, int] | None) -> pd.DataFrame:
+    """Filtra o extrato por (ano, mês). Se periodo=None, devolve tudo."""
+    if periodo is None:
+        return df
+    ano, mes = periodo
+    return df[(df["dt_mov"].dt.year == ano) & (df["dt_mov"].dt.month == mes)]
+
+
+def agregar_pessoas(df: pd.DataFrame, periodo: tuple[int, int] | None = None) -> pd.DataFrame:
     """
     Agrega cada contraparte das movimentações PIX/TED por nome (variações do
     mesmo nome são unidas).
@@ -174,12 +220,15 @@ def agregar_pessoas(df: pd.DataFrame) -> pd.DataFrame:
     A classificação usa o flag débito/crédito do extrato — assim uma linha
     'PIX - RECEBIDO DEVOLVIDO' (que é um débito) entra corretamente na saída.
 
+    `periodo` opcional = (ano, mês) para filtrar; None = desde o início.
+
     Retorna DataFrame [nome, entrada, saida, liquido] ordenado por líquido desc.
     Linhas sem entrada e sem saída (ex.: tarifas) são descartadas.
     """
-    movs = df[
-        df["ds_historico"].str.contains(r"PIX|TED|TEC", case=False, regex=True, na=False)
-        & ~df["ds_historico"].str.contains(r"TARIFA", case=False, regex=True, na=False)
+    base = _filtra_periodo(df, periodo)
+    movs = base[
+        base["ds_historico"].str.contains(r"PIX|TED", case=False, regex=True, na=False)
+        & ~base["ds_historico"].str.contains(r"TARIFA", case=False, regex=True, na=False)
     ].copy()
 
     if movs.empty:
@@ -215,9 +264,15 @@ def agregar_pessoas(df: pd.DataFrame) -> pd.DataFrame:
 # Geração do texto para WhatsApp
 # =============================================================================
 
-def gerar_resumo(nome_fundo: str, saldo_total: float, pessoas: pd.DataFrame) -> str:
-    """Monta o texto: cabeçalho, lista por pessoa e, à parte, o saldo."""
+def gerar_resumo(
+    nome_fundo: str,
+    saldo_total: float,
+    pessoas: pd.DataFrame,
+    periodo_label: str = "desde o início",
+) -> str:
+    """Monta o texto: cabeçalho, período, lista por pessoa e, à parte, o saldo."""
     out = [nome_fundo, ""]
+    out.append(f"Movimentações ({periodo_label}):")
 
     for _, r in pessoas.sort_values("liquido", ascending=False).iterrows():
         out.append(f"{r['nome']}:")
